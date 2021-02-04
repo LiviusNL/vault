@@ -26,17 +26,31 @@ func (c *Core) metricsLoop(stopCh chan struct{}) {
 	for {
 		select {
 		case <-emitTimer:
-			c.metricsMutex.Lock()
-			if c.expiration != nil {
-				c.expiration.emitMetrics()
+			if !c.PerfStandby() {
+				c.metricsMutex.Lock()
+				// Emit on active node only
+				if c.expiration != nil {
+					c.expiration.emitMetrics()
+				}
+				c.metricsMutex.Unlock()
 			}
-			// Refresh the sealed gauge
+
+			// Refresh the sealed gauge, on all nodes
 			if c.Sealed() {
 				c.metricSink.SetGaugeWithLabels([]string{"core", "unsealed"}, 0, nil)
 			} else {
 				c.metricSink.SetGaugeWithLabels([]string{"core", "unsealed"}, 1, nil)
 			}
-			c.metricsMutex.Unlock()
+
+			// Refresh the standby gauge, on all nodes
+			if standby, _ := c.Standby(); standby {
+				c.metricSink.SetGaugeWithLabels([]string{"core", "active"}, 0, nil)
+			} else {
+				c.metricSink.SetGaugeWithLabels([]string{"core", "active"}, 1, nil)
+			}
+
+			// Refresh gauge metrics that are looped
+			c.cachedGaugeMetricsEmitter()
 
 		case <-writeTimer:
 			if stopped := grabLockOrStop(c.stateLock.RLock, c.stateLock.RUnlock, stopCh); stopped {
@@ -44,7 +58,7 @@ func (c *Core) metricsLoop(stopCh chan struct{}) {
 				// should trigger
 				continue
 			}
-			if c.perfStandby {
+			if c.perfStandby { // already have lock here, do not re-acquire
 				syncCounter(c)
 			} else {
 				err := c.saveCurrentRequestCounters(context.Background(), time.Now())
@@ -54,6 +68,11 @@ func (c *Core) metricsLoop(stopCh chan struct{}) {
 			}
 			c.stateLock.RUnlock()
 		case <-identityCountTimer:
+			// Only emit on active node of cluster that is not a DR cecondary.
+			if standby, _ := c.Standby(); standby || c.IsDRSecondary() {
+				break
+			}
+
 			// TODO: this can be replaced by the identity gauge counter; we need to
 			// sum across all namespaces.
 			go func() {
@@ -97,6 +116,17 @@ func (c *Core) tokenGaugePolicyCollector(ctx context.Context) ([]metricsutil.Gau
 	return ts.gaugeCollectorByPolicy(ctx)
 }
 
+func (c *Core) leaseExpiryGaugeCollector(ctx context.Context) ([]metricsutil.GaugeLabelValues, error) {
+	c.stateLock.RLock()
+	e := c.expiration
+	metricsConsts := c.MetricSink().TelemetryConsts
+	c.stateLock.RUnlock()
+	if e == nil {
+		return []metricsutil.GaugeLabelValues{}, errors.New("nil expiration manager")
+	}
+	return e.leaseAggregationMetrics(ctx, metricsConsts)
+}
+
 func (c *Core) tokenGaugeMethodCollector(ctx context.Context) ([]metricsutil.GaugeLabelValues, error) {
 	c.stateLock.RLock()
 	ts := c.tokenStore
@@ -123,6 +153,9 @@ func (c *Core) emitMetrics(stopCh chan struct{}) {
 	// The gauge collection processes are started and stopped here
 	// because there's more than one TokenManager created during startup,
 	// but we only want one set of gauges.
+	//
+	// Both active nodes and performance standby nodes call emitMetrics
+	// so we have to handle both.
 
 	metricsInit := []struct {
 		MetricName    []string
@@ -140,6 +173,12 @@ func (c *Core) emitMetrics(stopCh chan struct{}) {
 			[]string{"token", "count", "by_policy"},
 			[]metrics.Label{{"gauge", "token_by_policy"}},
 			c.tokenGaugePolicyCollector,
+			"",
+		},
+		{
+			[]string{"expire", "leases", "by_expiration"},
+			[]metrics.Label{{"gauge", "leases_by_expiration"}},
+			c.leaseExpiryGaugeCollector,
 			"",
 		},
 		{
@@ -172,11 +211,19 @@ func (c *Core) emitMetrics(stopCh chan struct{}) {
 			c.entityGaugeCollectorByMount,
 			"",
 		},
+		{
+			[]string{"identity", "entity", "active", "partial_month"},
+			[]metrics.Label{{"gauge", "identity_active_month"}},
+			c.activeEntityGaugeCollector,
+			"",
+		},
 	}
 
+	// Disable collection if configured, or if we're a performance standby
+	// node or DR secondary cluster.
 	if c.MetricSink().GaugeInterval == time.Duration(0) {
 		c.logger.Info("usage gauge collection is disabled")
-	} else {
+	} else if standby, _ := c.Standby(); !standby && !c.IsDRSecondary() {
 		for _, init := range metricsInit {
 			if init.DisableEnvVar != "" {
 				if os.Getenv(init.DisableEnvVar) != "" {
@@ -217,6 +264,13 @@ func (c *Core) findKvMounts() []*kvMount {
 
 	c.mountsLock.RLock()
 	defer c.mountsLock.RUnlock()
+
+	// emitMetrics doesn't grab the statelock, so this code might run during or after the seal process.
+	// Therefore, we need to check if c.mounts is nil. If we do not, emitMetrics will panic if this is
+	// run after seal.
+	if c.mounts == nil {
+		return mounts
+	}
 
 	for _, entry := range c.mounts.Entries {
 		if entry.Type == "kv" {
@@ -294,7 +348,7 @@ func (c *Core) walkKvMountSecrets(ctx context.Context, m *kvMount) {
 			return
 		}
 		for _, path := range keys {
-			if path[len(path)-1] == '/' {
+			if len(path) > 0 && path[len(path)-1] == '/' {
 				subdirectories = append(subdirectories, currentDirectory+path)
 			} else {
 				m.NumSecrets += 1
@@ -404,4 +458,20 @@ func (c *Core) entityGaugeCollectorByMount(ctx context.Context) ([]metricsutil.G
 	}
 
 	return values, nil
+}
+
+func (c *Core) cachedGaugeMetricsEmitter() {
+	if c.metricsHelper == nil {
+		return
+	}
+
+	loopMetrics := &c.metricsHelper.LoopMetrics.Metrics
+
+	emit := func(key interface{}, value interface{}) bool {
+		metricValue := value.(metricsutil.GaugeMetric)
+		c.metricSink.SetGaugeWithLabels(metricValue.Key, metricValue.Value, metricValue.Labels)
+		return true
+	}
+
+	loopMetrics.Range(emit)
 }

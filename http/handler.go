@@ -146,6 +146,7 @@ func Handler(props *vault.HandlerProperties) http.Handler {
 		mux.Handle("/v1/sys/rekey-recovery-key/verify", handleRequestForwarding(core, handleSysRekeyVerify(core, true)))
 		mux.Handle("/v1/sys/storage/raft/bootstrap", handleSysRaftBootstrap(core))
 		mux.Handle("/v1/sys/storage/raft/join", handleSysRaftJoin(core))
+		mux.Handle("/v1/sys/internal/ui/feature-flags", handleSysInternalFeatureFlags(core))
 		for _, path := range injectDataIntoTopRoutes {
 			mux.Handle(path, handleRequestForwarding(core, handleLogicalWithInjector(core)))
 		}
@@ -235,7 +236,11 @@ func handleAuditNonLogical(core *vault.Core, h http.Handler) http.Handler {
 		input := &logical.LogInput{
 			Request: req,
 		}
-		core.AuditLogger().AuditRequest(r.Context(), input)
+		err = core.AuditLogger().AuditRequest(r.Context(), input)
+		if err != nil {
+			respondError(w, status, err)
+			return
+		}
 		cw := newCopyResponseWriter(w)
 		h.ServeHTTP(cw, r)
 		data := make(map[string]interface{})
@@ -245,7 +250,10 @@ func handleAuditNonLogical(core *vault.Core, h http.Handler) http.Handler {
 		}
 		httpResp := &logical.HTTPResponse{Data: data, Headers: cw.Header()}
 		input.Response = logical.HTTPResponseToLogicalResponse(httpResp)
-		core.AuditLogger().AuditResponse(r.Context(), input)
+		err = core.AuditLogger().AuditResponse(r.Context(), input)
+		if err != nil {
+			respondError(w, status, err)
+		}
 		return
 	})
 }
@@ -280,6 +288,7 @@ func wrapGenericHandler(core *vault.Core, h http.Handler, props *vault.HandlerPr
 		} else {
 			ctx, cancelFunc = context.WithTimeout(ctx, maxRequestDuration)
 		}
+		// if maxRequestSize < 0, no need to set context value
 		// Add a size limiter if desired
 		if maxRequestSize > 0 {
 			ctx = context.WithValue(ctx, "max_request_size", maxRequestSize)

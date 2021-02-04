@@ -230,7 +230,7 @@ func deriveStableActiveCore(t testing.T, cluster *vault.TestCluster) *vault.Test
 }
 
 func DeriveActiveCore(t testing.T, cluster *vault.TestCluster) *vault.TestClusterCore {
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 20; i++ {
 		for _, core := range cluster.Cores {
 			leaderResp, err := core.Client.Sys().Leader()
 			if err != nil {
@@ -278,6 +278,25 @@ func WaitForNCoresUnsealed(t testing.T, cluster *vault.TestCluster, n int) {
 	}
 
 	t.Fatalf("%d cores were not unsealed", n)
+}
+
+func SealCores(t testing.T, cluster *vault.TestCluster) {
+	t.Helper()
+	for _, core := range cluster.Cores {
+		if err := core.Shutdown(); err != nil {
+			t.Fatal(err)
+		}
+		timeout := time.Now().Add(3 * time.Second)
+		for {
+			if time.Now().After(timeout) {
+				t.Fatal("timeout waiting for core to seal")
+			}
+			if core.Sealed() {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
 func WaitForNCoresSealed(t testing.T, cluster *vault.TestCluster, n int) {
@@ -597,4 +616,40 @@ func GenerateDebugLogs(t testing.T, client *api.Client) chan struct{} {
 	}()
 
 	return stopCh
+}
+
+func VerifyRaftPeers(t testing.T, client *api.Client, expected map[string]bool) {
+	t.Helper()
+
+	resp, err := client.Logical().Read("sys/storage/raft/configuration")
+	if err != nil {
+		t.Fatalf("error reading raft config: %v", err)
+	}
+
+	if resp == nil || resp.Data == nil {
+		t.Fatal("missing response data")
+	}
+
+	config, ok := resp.Data["config"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing config in response data")
+	}
+
+	servers, ok := config["servers"].([]interface{})
+	if !ok {
+		t.Fatal("missing servers in response data config")
+	}
+
+	// Iterate through the servers and remove the node found in the response
+	// from the expected collection
+	for _, s := range servers {
+		server := s.(map[string]interface{})
+		delete(expected, server["node_id"].(string))
+	}
+
+	// If the collection is non-empty, it means that the peer was not found in
+	// the response.
+	if len(expected) != 0 {
+		t.Fatalf("failed to read configuration successfully, expected peers no found in configuration list: %v", expected)
+	}
 }

@@ -1267,7 +1267,7 @@ func generateRoleSteps(t *testing.T, useCSRs bool) []logicaltest.TestStep {
 		roleVals.OU = []string{"foo"}
 		addTests(getOuCheck(roleVals))
 
-		roleVals.OU = []string{"foo", "bar"}
+		roleVals.OU = []string{"bar", "foo"}
 		addTests(getOuCheck(roleVals))
 	}
 	// Organization tests
@@ -2797,7 +2797,8 @@ func TestBackend_AllowedDomainsTemplate(t *testing.T) {
 
 	// Write role PKI.
 	_, err = client.Logical().Write("pki/roles/test", map[string]interface{}{
-		"allowed_domains":          []string{"foobar.com", "zipzap.com", "{{identity.entity.aliases." + userpassAccessor + ".name}}"},
+		"allowed_domains": []string{"foobar.com", "zipzap.com", "{{identity.entity.aliases." + userpassAccessor + ".name}}",
+			"foo.{{identity.entity.aliases." + userpassAccessor + ".name}}.example.com"},
 		"allowed_domains_template": true,
 		"allow_bare_domains":       true,
 	})
@@ -2821,6 +2822,12 @@ func TestBackend_AllowedDomainsTemplate(t *testing.T) {
 	// Issue certificate for unknown userpassname.
 	_, err = client.Logical().Write("pki/issue/test", map[string]interface{}{"common_name": "unknownuserpassname"})
 	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	// Issue certificate for foo.userpassname.domain.
+	_, err = client.Logical().Write("pki/issue/test", map[string]interface{}{"common_name": "foo.userpassname.example.com"})
+	if err != nil {
 		t.Fatal("expected error")
 	}
 

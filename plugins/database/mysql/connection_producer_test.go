@@ -14,7 +14,7 @@ import (
 
 	"github.com/hashicorp/vault/helper/testhelpers/certhelpers"
 	"github.com/hashicorp/vault/sdk/database/helper/dbutil"
-	"github.com/ory/dockertest"
+	dockertest "github.com/ory/dockertest/v3"
 )
 
 func Test_addTLStoDSN(t *testing.T) {
@@ -44,6 +44,11 @@ func Test_addTLStoDSN(t *testing.T) {
 			rootUrl:        "user:pa?ssword?@tcp(localhost:3306)/test?foo=bar",
 			tlsConfigName:  "tlsTest101",
 			expectedResult: "user:pa?ssword?@tcp(localhost:3306)/test?tls=tlsTest101&foo=bar",
+		},
+		"tls, valid tls parameter in query string": {
+			rootUrl:        "user:password@tcp(localhost:3306)/test?tls=true",
+			tlsConfigName:  "",
+			expectedResult: "user:password@tcp(localhost:3306)/test?tls=true",
 		},
 	}
 
@@ -119,7 +124,7 @@ ssl-key=/etc/mysql/server-key.pem`
 
 	// //////////////////////////////////////////////////////
 	// Test
-	mysql := new(25, 25, 25)
+	mysql := newMySQL(MetadataLen, MetadataLen, UsernameLen)
 
 	conf := map[string]interface{}{
 		"connection_url":      retURL,
